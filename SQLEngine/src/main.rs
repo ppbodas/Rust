@@ -130,7 +130,7 @@ fn handle_insert(db: &mut Engine, tokens: &[&str]) {
 
     let user = User::new(id, name, age, phone, address);
     let start = Instant::now();
-    match db.insert_unique(&user) {
+    match db.insert_unique(&user, true) {
         Ok(Ok(_))    => println!("Inserted id={} in {:.2?}", id, start.elapsed()),
         Ok(Err(msg)) => println!("Error: {msg}"),
         Err(e)       => println!("Error: {e}"),

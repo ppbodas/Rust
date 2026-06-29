@@ -160,8 +160,9 @@ impl Page {
         Some(slot)
     }
 
-    /// Overwrite an existing record in-place by id. Returns true if found.
-    pub fn leaf_update(&mut self, user: &User) -> bool {
+    /// Overwrite an existing record in-place by id.
+    /// Returns Some((slot, old_record)) if found, None if not found.
+    pub fn leaf_update(&mut self, user: &User) -> Option<(usize, User)> {
         let n = self.header().num_slots as usize;
         let mut lo = 0usize;
         let mut hi = n;
@@ -170,14 +171,15 @@ impl Page {
             let rec = self.leaf_read(mid as u32);
             match rec.id.cmp(&user.id) {
                 std::cmp::Ordering::Equal => {
+                    let old = rec;
                     self.leaf_write(mid as u32, user);
-                    return true;
+                    return Some((mid, old));
                 }
                 std::cmp::Ordering::Less    => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
             }
         }
-        false
+        None
     }
 
     /// Binary search for a key in a leaf. Returns Some(User) if found.

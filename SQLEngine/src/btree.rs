@@ -26,6 +26,11 @@ impl<'a> BTree<'a> {
 
     pub fn insert(&mut self, user: &User) -> std::io::Result<()> {
         let root_id = self.pager.root_page_id;
+
+        if self.verbose {
+            println!("  [insert] starting at root page {}", root_id);
+        }
+
         let split = self.insert_recursive(root_id, user)?;
 
         if let Some(s) = split {
@@ -38,6 +43,14 @@ impl<'a> BTree<'a> {
             self.pager.write_page(new_root_id, &new_root)?;
             self.pager.root_page_id = new_root_id;
             self.pager.flush_meta()?;
+
+            if self.verbose {
+                println!("  [insert] ROOT SPLIT — new root page {} created",  new_root_id);
+                println!("           left subtree  = old root page {}", root_id);
+                println!("           right subtree = page {}", s.new_page_id);
+                println!("           separator key = {}", s.pushed_up_key);
+                println!("           tree height increased by 1");
+            }
         }
 
         Ok(())
@@ -144,19 +157,67 @@ impl<'a> BTree<'a> {
     /// Returns false if no record with that id exists.
     pub fn update(&mut self, user: &User) -> std::io::Result<bool> {
         let root_id = self.pager.root_page_id;
+
+        if self.verbose {
+            println!("  [update] searching for id={}", user.id);
+        }
+
         let leaf_id = self.find_leaf_page(root_id, user.id)?;
         if leaf_id == u32::MAX {
             return Ok(false);
         }
+
         let mut page = self.pager.read_page(leaf_id)?;
-        if page.leaf_update(user) {
-            if self.verbose {
-                println!("  [update] overwrote record in-place at page {}", leaf_id);
+        let n = page.header().num_slots as usize;
+
+        if self.verbose {
+            let first = if n > 0 { page.leaf_read(0).id } else { 0 };
+            let last  = if n > 0 { page.leaf_read(n as u32 - 1).id } else { 0 };
+            println!("  [update] arrived at page {} [LEAF, {} records, ids {}..{}]",
+                leaf_id, n, first, last);
+        }
+
+        match page.leaf_update(user) {
+            None => Ok(false),
+            Some((slot, old)) => {
+                if self.verbose {
+                    let off = crate::config::PAGE_HEADER_SIZE + slot * crate::config::RECORD_SIZE;
+                    println!("  [update] found id={} at slot[{}]  offset={} ({}+{}×{})",
+                        user.id, slot, off,
+                        crate::config::PAGE_HEADER_SIZE, slot, crate::config::RECORD_SIZE);
+                    println!("  [update] overwriting in-place (no slot shift needed):");
+                    println!("           field     OLD value            NEW value");
+                    println!("           ─────────────────────────────────────────────────────");
+                    println!("           id        {:<20} {} (unchanged — key field)",
+                        old.id, user.id);
+                    if old.name != user.name {
+                        println!("           name      {:<20} {}", old.name, user.name);
+                    } else {
+                        println!("           name      {:<20} (unchanged)", old.name);
+                    }
+                    if old.age != user.age {
+                        println!("           age       {:<20} {}", old.age, user.age);
+                    } else {
+                        println!("           age       {:<20} (unchanged)", old.age);
+                    }
+                    if old.phone != user.phone {
+                        println!("           phone     {:<20} {}", old.phone, user.phone);
+                    } else {
+                        println!("           phone     {:<20} (unchanged)", old.phone);
+                    }
+                    if old.address != user.address {
+                        println!("           address   {:<20} {}", old.address, user.address);
+                    } else {
+                        println!("           address   {:<20} (unchanged)", old.address);
+                    }
+                    println!("  [update] 128 bytes written at offset {}..{} in page {}",
+                        off, off + crate::config::RECORD_SIZE, leaf_id);
+                    println!("  [update] no other slots moved — all offsets unchanged");
+                    println!("  [update] writing page {} to disk", leaf_id);
+                }
+                self.pager.write_page(leaf_id, &page)?;
+                Ok(true)
             }
-            self.pager.write_page(leaf_id, &page)?;
-            Ok(true)
-        } else {
-            Ok(false)
         }
     }
 
@@ -229,31 +290,103 @@ impl<'a> BTree<'a> {
         let page = self.pager.read_page(page_id)?;
         let hdr = page.header();
 
+        if self.verbose {
+            match hdr.page_type {
+                PageType::Internal => {
+                    let (child_id, reason) = page.internal_find_child_logged(user.id);
+                    println!("  [insert] page {:4} [INTERNAL, {:3} keys  ] → {}",
+                        page_id, hdr.num_slots, reason);
+                    // recurse after logging
+                    let _ = child_id; // already computed inside internal_insert
+                }
+                PageType::Leaf => {
+                    let n = hdr.num_slots as usize;
+                    let first = if n > 0 { page.leaf_read(0).id } else { 0 };
+                    let last  = if n > 0 { page.leaf_read(n as u32 - 1).id } else { 0 };
+                    println!("  [insert] page {:4} [LEAF,     {:3} records, ids {}..{}] → inserting here",
+                        page_id, n, first, last);
+                }
+                PageType::Meta => {}
+            }
+        }
+
         match hdr.page_type {
-            PageType::Leaf => self.leaf_insert(page_id, page, user),
+            PageType::Leaf     => self.leaf_insert(page_id, page, user),
             PageType::Internal => self.internal_insert(page_id, page, user),
-            PageType::Meta => unreachable!("traversed into meta page"),
+            PageType::Meta     => unreachable!("traversed into meta page"),
         }
     }
 
     fn leaf_insert(&mut self, page_id: u32, mut page: Page, user: &User) -> std::io::Result<Option<SplitResult>> {
         if !page.leaf_is_full() {
+            let n = page.header().num_slots as usize;
+
+            // Find insertion slot index before mutating
+            let insert_pos = (0..n).find(|&i| page.leaf_read(i as u32).id > user.id).unwrap_or(n);
+
+            if self.verbose {
+                let off = crate::config::PAGE_HEADER_SIZE + insert_pos * crate::config::RECORD_SIZE;
+                println!("  [insert] page has room ({}/{}), no split needed", n, crate::config::LEAF_CAPACITY);
+                println!("  [insert] inserting id={} at slot[{}]  offset={} ({}+{}×{})",
+                    user.id, insert_pos, off,
+                    crate::config::PAGE_HEADER_SIZE, insert_pos, crate::config::RECORD_SIZE);
+                if insert_pos < n {
+                    println!("  [insert] shifting slots {}..{} one position RIGHT to make room:",
+                        insert_pos, n - 1);
+                    for i in (insert_pos..n).rev() {
+                        let rec     = page.leaf_read(i as u32);
+                        let old_off = crate::config::PAGE_HEADER_SIZE + i * crate::config::RECORD_SIZE;
+                        let new_off = crate::config::PAGE_HEADER_SIZE + (i + 1) * crate::config::RECORD_SIZE;
+                        println!("           id={:<6}  offset {} → {}  (slot[{}] → slot[{}])",
+                            rec.id, old_off, new_off, i, i + 1);
+                    }
+                }
+            }
+
             page.leaf_insert_sorted(user);
+
+            if self.verbose {
+                let new_n = page.header().num_slots as usize;
+                println!("  [insert] wrote id={} at slot[{}]  offset={}",
+                    user.id, insert_pos,
+                    crate::config::PAGE_HEADER_SIZE + insert_pos * crate::config::RECORD_SIZE);
+                println!("  [insert] num_slots: {} → {}", n, new_n);
+                println!("  [insert] writing page {} to disk", page_id);
+            }
+
             self.pager.write_page(page_id, &page)?;
             return Ok(None);
         }
 
         // Leaf is full — split
+        let n = page.header().num_slots as usize;
+
+        if self.verbose {
+            println!("  [insert] page {} is FULL ({}/{}) — SPLIT required",
+                page_id, n, crate::config::LEAF_CAPACITY);
+        }
+
         let new_leaf_id = self.pager.allocate_page()?;
 
         // Collect all records + new one, sorted
-        let n = page.header().num_slots as usize;
         let mut records: Vec<User> = (0..n as u32).map(|i| page.leaf_read(i)).collect();
         let pos = records.partition_point(|r| r.id < user.id);
         records.insert(pos, user.clone());
 
         let mid = records.len() / 2;
         let pushed_up_key = records[mid].id;
+
+        if self.verbose {
+            println!("  [insert] merging {} existing + 1 new = {} records, sorted",
+                n, records.len());
+            println!("  [insert] split at midpoint {}:", mid);
+            println!("           LEFT  page {:4} ← ids {}..{} ({} records)",
+                page_id, records[0].id, records[mid-1].id, mid);
+            println!("           RIGHT page {:4} ← ids {}..{} ({} records)",
+                new_leaf_id, records[mid].id, records.last().unwrap().id, records.len() - mid);
+            println!("  [insert] pushed-up key={} → parent must add (key={}, right_child=page_{})",
+                pushed_up_key, pushed_up_key, new_leaf_id);
+        }
 
         // Left leaf keeps [0..mid)
         let mut left = Page::new();
@@ -284,6 +417,14 @@ impl<'a> BTree<'a> {
             right.write_header(&h);
         }
 
+        if self.verbose {
+            println!("  [insert] writing left  half to page {} (next_leaf=page_{})",
+                page_id, new_leaf_id);
+            println!("  [insert] writing right half to page {} (next_leaf=page_{})",
+                new_leaf_id,
+                if old_next == u32::MAX { "none".to_string() } else { old_next.to_string() });
+        }
+
         self.pager.write_page(page_id, &left)?;
         self.pager.write_page(new_leaf_id, &right)?;
 
@@ -302,12 +443,21 @@ impl<'a> BTree<'a> {
         let mut page = self.pager.read_page(page_id)?;
 
         if !page.internal_is_full() {
+            if self.verbose {
+                let n = page.header().num_slots as usize;
+                println!("  [insert] propagating split: page {} [INTERNAL, {} keys] ← inserting key={} right_child=page_{}",
+                    page_id, n, s.pushed_up_key, s.new_page_id);
+            }
             page.internal_insert_sorted(s.pushed_up_key, s.new_page_id);
             self.pager.write_page(page_id, &page)?;
             return Ok(None);
         }
 
         // Internal node is full — split it
+        if self.verbose {
+            println!("  [insert] internal page {} is FULL — splitting internal node", page_id);
+        }
+
         let new_internal_id = self.pager.allocate_page()?;
 
         let n = page.header().num_slots as usize;

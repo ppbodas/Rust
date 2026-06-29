@@ -26,8 +26,12 @@ impl Engine {
     }
 
     /// Insert rejecting duplicates. Returns Err string if id already exists.
-    pub fn insert_unique(&mut self, user: &User) -> std::io::Result<Result<(), String>> {
-        BTree::new(&mut self.pager).insert_unique(user)
+    pub fn insert_unique(&mut self, user: &User, verbose: bool) -> std::io::Result<Result<(), String>> {
+        if verbose {
+            BTree::new_verbose(&mut self.pager).insert_unique(user)
+        } else {
+            BTree::new(&mut self.pager).insert_unique(user)
+        }
     }
 
     /// Update non-key fields in-place. Returns false if id not found.
