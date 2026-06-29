@@ -29,18 +29,30 @@ A from-scratch SQL storage engine built in Rust to understand how databases stor
    - [Full Tree Picture](#full-tree-picture)
 8. [Real Numbers from 10,000 Records](#real-numbers-from-10000-records)
 9. [Running](#running)
+10. [Commands and Sample Inputs](#commands-and-sample-inputs)
+11. [Traversal Logs](#traversal-logs)
+    - [INSERT logs](#insert-logs)
+    - [UPDATE logs](#update-logs)
+    - [DELETE logs](#delete-logs)
+    - [FIND logs](#find-logs)
+    - [RANGE logs](#range-logs)
 
 ---
 
 ## Overview
 
-The engine stores `User` records indexed by `id` (u64) in a B+ tree written directly to a binary file (`users.db`). There is no query parser — the engine exposes three operations:
+The engine stores `User` records indexed by `id` (u64) in a B+ tree written directly to a binary file (`users.db`). There is no query parser — the engine exposes these operations via an interactive REPL:
 
-```
-insert(user)
-find_by_id(id)          → Option<User>
-range_query(start, end) → Vec<User>
-```
+| Command | Description |
+|---|---|
+| `INSERT <id> <name> <age> <phone> <address>` | Add a record (rejects duplicate ids) |
+| `UPDATE <id> <name> <age> <phone> <address>` | Overwrite non-key fields in-place |
+| `DELETE <id>` | Remove a record, compact the leaf page |
+| `FIND <id>` | Point lookup via B+ tree traversal |
+| `RANGE <start> <end>` | Scan all records in id range |
+| `COUNT` | Count all records by scanning leaf chain |
+
+Every mutating and read command prints **step-by-step traversal logs** showing exactly which pages were read, which slots shifted, and what bytes were written.
 
 ---
 
@@ -673,6 +685,49 @@ Bye.
 
 ---
 
+### UPDATE
+
+Update non-key fields (name, age, phone, address) in-place for an existing id.
+The record is overwritten at the same slot and offset — no slots shift, no page split.
+To change the `id` itself, use `DELETE` + `INSERT`.
+
+```
+UPDATE <id> <name> <age> <phone> <address>
+```
+
+**Examples:**
+
+```
+sql> UPDATE 100 Alice 45 +1-999-0100 456 New Ave Boston
+Updated id=100 in 16µs
+
+sql> UPDATE 99999 Ghost 20 +1-000-0000 Nowhere
+No record with id=99999. Use INSERT to add it.
+```
+
+---
+
+### DELETE
+
+Remove a record by id. Shifts all subsequent slots in the leaf one position left
+to compact the page. No underflow merging — partially filled pages remain as-is.
+
+```
+DELETE <id>
+```
+
+**Examples:**
+
+```
+sql> DELETE 100
+Deleted id=100 in 185µs
+
+sql> DELETE 99999
+No record with id=99999
+```
+
+---
+
 ### HELP
 
 Print all available commands.
@@ -680,7 +735,9 @@ Print all available commands.
 ```
 sql> HELP
 Commands:
-  INSERT <id> <name> <age> <phone> <address>   Insert a user record
+  INSERT <id> <name> <age> <phone> <address>   Insert a user (error if id exists)
+  UPDATE <id> <name> <age> <phone> <address>   Update non-key fields in-place
+  DELETE <id>                                   Delete a record by id
   FIND   <id>                                   Lookup by id
   RANGE  <start_id> <end_id>                   Fetch all ids in range
   COUNT                                         Count all records
@@ -700,29 +757,34 @@ $ cargo run -- seed          # load 10k records
 Seeding 10,000 records into users.db...
 Done in 213ms. Database: users.db
 
-$ cargo run                  # open shell
+$ cargo run                  # open interactive shell
 SQLEngine — database: users.db
 Type HELP for available commands.
 
 sql> FIND 7777
 Found in 12µs:
-  id=7777   name=User_7777       age=57   phone=+1-555-7777     address=7777 Main St, City 77
+  id=7777   name=User_7777   age=57   phone=+1-555-7777   address=7777 Main St, City 77
 
-sql> INSERT 99999 Zara 29 +1-555-9999 99 Harbor Blvd, Miami
-Inserted id=99999 in 10µs
+sql> UPDATE 7777 Zara 29 +1-999-7777 99 Harbor Blvd Miami
+Updated id=7777 in 16µs
 
-sql> FIND 99999
-Found in 13µs:
-  id=99999  name=Zara            age=29   phone=+1-555-9999     address=99 Harbor Blvd, Miami
+sql> INSERT 7777 Dup 99 +1-000-0000 Nowhere
+Error: id=7777 already exists. Use UPDATE to modify it.
 
-sql> RANGE 9998 10001
+sql> DELETE 7777
+Deleted id=7777 in 185µs
+
+sql> FIND 7777
+No record with id=7777
+
+sql> RANGE 9998 10000
 3 record(s) found in 18µs:
-  id=9998   name=User_9998       age=58   phone=+1-555-9998     address=9998 Main St, City 98
-  id=9999   name=User_9999       age=59   phone=+1-555-9999     address=9999 Main St, City 99
-  id=10000  name=User_10000      age=60   phone=+1-555-10000    address=10000 Main St, City 0
+  id=9998    name=User_9998    age=58   phone=+1-555-9998    address=9998 Main St, City 98
+  id=9999    name=User_9999    age=59   phone=+1-555-9999    address=9999 Main St, City 99
+  id=10000   name=User_10000   age=60   phone=+1-555-10000   address=10000 Main St, City 0
 
 sql> COUNT
-Total records: 10001 (scanned in 12ms)
+Total records: 9999 (scanned in 12ms)
 
 sql> EXIT
 Bye.
@@ -733,3 +795,154 @@ To start completely fresh, delete `users.db`:
 ```bash
 rm users.db && cargo run
 ```
+
+---
+
+## Traversal Logs
+
+Every command prints step-by-step logs showing exactly which pages were read,
+which slots moved, and what bytes were written. This makes the engine a learning
+tool — you can watch the B+ tree work in real time.
+
+---
+
+### INSERT logs
+
+**Case 1 — room available, no split:**
+
+```
+sql> INSERT 100 Alice 30 +1-555-0100 100 Main St NY
+  [insert] starting at root page 344
+  [insert] page  344 [INTERNAL,   2 keys] → id 100 < key[0]=2737 → leftmost child → page 3
+  [insert] page    3 [INTERNAL, 170 keys] → key[5]=97 ≤ id 100 < key[6]=113 → page 8
+  [insert] page    8 [LEAF,      15 records, ids 97..112] → inserting here
+  [insert] page has room (15/31), no split needed
+  [insert] inserting id=100 at slot[3]  offset=408 (24+3×128)
+  [insert] shifting slots 3..14 one position RIGHT to make room:
+           id=101   offset 408 → 536  (slot[3] → slot[4])
+           id=102   offset 536 → 664  (slot[4] → slot[5])
+           ...
+  [insert] wrote id=100 at slot[3]  offset=408
+  [insert] num_slots: 15 → 16
+  [insert] writing page 8 to disk
+Inserted id=100 in 104µs
+```
+
+**Case 2 — leaf full, split required:**
+
+```
+sql> INSERT 32 User32 52 +1-555-0032 32 Main St
+  [insert] page    1 [LEAF, 31 records, ids 1..31] → inserting here
+  [insert] page 1 is FULL (31/31) — SPLIT required
+  [insert] merging 31 existing + 1 new = 32 records, sorted
+  [insert] split at midpoint 16:
+           LEFT  page  1 ← ids 1..16  (16 records)
+           RIGHT page  2 ← ids 17..32 (16 records)
+  [insert] pushed-up key=17 → parent must add (key=17, right_child=page_2)
+  [insert] writing left  half to page 1 (next_leaf=page_2)
+  [insert] writing right half to page 2 (next_leaf=none)
+  [insert] ROOT SPLIT — new root page 3 created
+           left subtree  = old root page 1
+           right subtree = page 2
+           separator key = 17
+           tree height increased by 1
+Inserted id=32 in 38µs
+```
+
+---
+
+### UPDATE logs
+
+UPDATE overwrites exactly 128 bytes in-place. No slots shift, no tree changes.
+
+```
+sql> UPDATE 200 NewAlice 45 +1-999-0200 789 New Ave Boston
+  [update] searching for id=200
+  [update] page   14 [LEAF, 16 records, ids 193..208] → start scanning here
+  [update] arrived at page 14 [LEAF, 16 records, ids 193..208]
+  [update] found id=200 at slot[7]  offset=920 (24+7×128)
+  [update] overwriting in-place (no slot shift needed):
+           field     OLD value            NEW value
+           ─────────────────────────────────────────────────────
+           id        200                  200 (unchanged — key field)
+           name      User_200             NewAlice
+           age       40                   45
+           phone     +1-555-0200          +1-999-0200
+           address   200 Main St, City 0  789 New Ave Boston
+  [update] 128 bytes written at offset 920..1048 in page 14
+  [update] no other slots moved — all offsets unchanged
+  [update] writing page 14 to disk
+Updated id=200 in 69µs
+```
+
+---
+
+### DELETE logs
+
+DELETE removes the slot and shifts all subsequent slots left to compact the page.
+
+```
+sql> DELETE 100
+  [delete] searching for id=100
+  [delete] arrived at page 8 [LEAF, 16 records, ids 97..112]
+  [delete] page 8 slot layout BEFORE delete:
+           slot[ 0]  offset=24     id=97
+           slot[ 1]  offset=152    id=98
+           slot[ 2]  offset=280    id=99
+           slot[ 3]  offset=408    id=100 ← DELETE THIS
+           slot[ 4]  offset=536    id=101
+           ...
+           slot[15]  offset=1944   id=112
+  [delete] removed slot[3] at offset 408 (24+3×128)
+  [delete] shifting slots 4..15 one position LEFT:
+           id=101   offset 536 → 408  (slot[4] → slot[3])
+           id=102   offset 664 → 536  (slot[5] → slot[4])
+           ...
+           id=112   offset 1944 → 1816  (slot[15] → slot[14])
+  [delete] slot[15] at offset 1944 zeroed (free space)
+  [delete] num_slots: 16 → 15
+  [delete] page 8 slot layout AFTER delete:
+           slot[ 0]  offset=24     id=97
+           ...
+           slot[ 3]  offset=408    id=101
+           ...
+           slot[14]  offset=1816   id=112
+           slot[15]  offset=1944   [empty / zeroed]
+  [delete] writing page 8 to disk
+Deleted id=100 in 185µs
+```
+
+---
+
+### FIND logs
+
+```
+sql> FIND 7777
+  [traversal] starting at root page 344
+  [traversal] page  344 [INTERNAL,   2 keys] → id 7777 ≥ key[1]=5473 → rightmost child → page 516
+  [traversal] page  516 [INTERNAL, 282 keys] → key[143]=7777 ≤ id 7777 < key[144]=7793 → page 490
+  [traversal] page  490 [LEAF,      16 records, ids 7777..7792] → binary search for id=7777
+  [traversal] → FOUND at page 490
+Found in 54µs:
+  id=7777   name=User_7777   age=57   phone=+1-555-7777   address=7777 Main St, City 77
+```
+
+---
+
+### RANGE logs
+
+```
+sql> RANGE 500 510
+  [traversal] locating start leaf for id=500
+  [traversal] page  344 [INTERNAL,  2 keys] → id 500 < key[0]=2737 → leftmost child → page 3
+  [traversal] page    3 [INTERNAL, 170 keys] → key[30]=497 ≤ id 500 < key[31]=513 → page 33
+  [traversal] page   33 [LEAF,      16 records, ids 497..512] → start scanning here
+  [leaf 0] page 33 │ 16 records (id 497..512) │ collected 11 │ next → page 34 │ RANGE END
+11 record(s) found in 16µs:
+  id=500    name=User_500   ...
+  ...
+  id=510    name=User_510   ...
+```
+
+The `[leaf N]` lines show each leaf page scanned, how many records were collected
+from it, and where the chain continues. `RANGE END` marks the leaf where the scan stopped.
