@@ -2,28 +2,40 @@ use crate::page::{Page, PageHeader, PageType};
 use crate::pager::Pager;
 use crate::record::User;
 
+/// B+ tree over the page file managed by [`Pager`].
+///
+/// `BTree` is created per-operation — it borrows the pager for the duration of one
+/// call and is then dropped. The `verbose` flag causes every method to print
+/// step-by-step logs of page reads, routing decisions, slot shifts, and splits.
 pub struct BTree<'a> {
     pager: &'a mut Pager,
     verbose: bool,
 }
 
-/// Returned when a child page splits — the parent must insert this key + new page.
+/// Returned by a recursive insert when a node split occurs.
+/// The parent must absorb `pushed_up_key` as a new separator pointing to `new_page_id`.
 struct SplitResult {
     pushed_up_key: u64,
     new_page_id: u32,
 }
 
 impl<'a> BTree<'a> {
+    /// Create a BTree that operates silently (no stdout logs).
     pub fn new(pager: &'a mut Pager) -> Self {
         BTree { pager, verbose: false }
     }
 
+    /// Create a BTree that prints step-by-step traversal and mutation logs to stdout.
     pub fn new_verbose(pager: &'a mut Pager) -> Self {
         BTree { pager, verbose: true }
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
 
+    /// Insert `user` into the B+ tree without checking for duplicates.
+    ///
+    /// Used by the seed command for bulk-load speed. If the root leaf splits,
+    /// a new root internal node is created and `pager.root_page_id` is updated.
     pub fn insert(&mut self, user: &User) -> std::io::Result<()> {
         let root_id = self.pager.root_page_id;
 
@@ -34,15 +46,15 @@ impl<'a> BTree<'a> {
         let split = self.insert_recursive(root_id, user)?;
 
         if let Some(s) = split {
-            // Root split — create a new root internal node
+            // The old root split — promote a new root internal node one level up
             let new_root_id = self.pager.allocate_page()?;
             let mut new_root = Page::new();
             new_root.write_header(&PageHeader::new(PageType::Internal));
-            new_root.internal_set_leftmost_child(root_id);
+            new_root.internal_set_leftmost_child(root_id);        // old root becomes left child
             new_root.internal_insert_sorted(s.pushed_up_key, s.new_page_id);
             self.pager.write_page(new_root_id, &new_root)?;
             self.pager.root_page_id = new_root_id;
-            self.pager.flush_meta()?;
+            self.pager.flush_meta()?; // durably record the new root
 
             if self.verbose {
                 println!("  [insert] ROOT SPLIT — new root page {} created",  new_root_id);
@@ -56,7 +68,13 @@ impl<'a> BTree<'a> {
         Ok(())
     }
 
-    /// Delete a record by id. Returns false if not found.
+    /// Delete the record with `id` from the tree.
+    ///
+    /// Traverses to the correct leaf, then removes the slot and shifts subsequent
+    /// slots left to compact the page. No underflow merging — partially full pages
+    /// remain as-is (a real engine would merge or redistribute; we skip that here).
+    ///
+    /// Returns `true` if deleted, `false` if no record with that id was found.
     pub fn delete(&mut self, id: u64) -> std::io::Result<bool> {
         let root_id = self.pager.root_page_id;
 
@@ -64,7 +82,6 @@ impl<'a> BTree<'a> {
             println!("  [delete] searching for id={}", id);
         }
 
-        // Traverse to the leaf page
         let leaf_id = self.find_leaf_page(root_id, id)?;
         if leaf_id == u32::MAX {
             return Ok(false);
@@ -75,11 +92,12 @@ impl<'a> BTree<'a> {
         let n = hdr.num_slots as usize;
 
         if self.verbose {
-            // Show full leaf state before delete
             let first = if n > 0 { page.leaf_read(0).id } else { 0 };
             let last  = if n > 0 { page.leaf_read(n as u32 - 1).id } else { 0 };
             println!("  [delete] arrived at page {} [LEAF, {} records, ids {}..{}]",
                 leaf_id, n, first, last);
+
+            // Print the full slot map so the user can see exactly which slot is removed
             println!("  [delete] page {} slot layout BEFORE delete:", leaf_id);
             for i in 0..n {
                 let rec  = page.leaf_read(i as u32);
@@ -89,7 +107,6 @@ impl<'a> BTree<'a> {
             }
         }
 
-        // Perform the delete — returns the slot index that was removed
         let result = page.leaf_delete(id);
 
         match result {
@@ -124,7 +141,7 @@ impl<'a> BTree<'a> {
                         crate::config::PAGE_HEADER_SIZE + new_n * crate::config::RECORD_SIZE);
                     println!("  [delete] num_slots: {} → {}", new_n + 1, new_n);
 
-                    // Show full page after delete
+                    // Print the full slot map after the delete for comparison
                     println!("  [delete] page {} slot layout AFTER delete:", leaf_id);
                     for i in 0..new_n {
                         let rec = page.leaf_read(i as u32);
@@ -133,7 +150,6 @@ impl<'a> BTree<'a> {
                     }
                     let empty_off = crate::config::PAGE_HEADER_SIZE + new_n * crate::config::RECORD_SIZE;
                     println!("           slot[{:2}]  offset={:<5}  [empty / zeroed]", new_n, empty_off);
-
                     println!("  [delete] writing page {} to disk", leaf_id);
                 }
 
@@ -143,7 +159,10 @@ impl<'a> BTree<'a> {
         }
     }
 
-    /// Insert, rejecting duplicate keys. Returns Err if id already exists.
+    /// Insert `user`, rejecting the operation if a record with the same id already exists.
+    ///
+    /// Does a point lookup first (`find`), then delegates to `insert` only if the id is new.
+    /// Returns `Ok(Err(msg))` if the id is a duplicate so the REPL can print the message.
     pub fn insert_unique(&mut self, user: &User) -> std::io::Result<Result<(), String>> {
         let root_id = self.pager.root_page_id;
         if self.find_recursive(root_id, user.id)?.is_some() {
@@ -153,8 +172,12 @@ impl<'a> BTree<'a> {
         Ok(Ok(()))
     }
 
-    /// Update non-key fields of an existing record in-place.
-    /// Returns false if no record with that id exists.
+    /// Overwrite the non-key fields (name, age, phone, address) of an existing record.
+    ///
+    /// Traverses to the correct leaf and writes 128 bytes at the exact slot offset.
+    /// No slots shift — the id (which determines sort order) is unchanged.
+    ///
+    /// Returns `true` if found and updated, `false` if no record with that id exists.
     pub fn update(&mut self, user: &User) -> std::io::Result<bool> {
         let root_id = self.pager.root_page_id;
 
@@ -188,8 +211,9 @@ impl<'a> BTree<'a> {
                     println!("  [update] overwriting in-place (no slot shift needed):");
                     println!("           field     OLD value            NEW value");
                     println!("           ─────────────────────────────────────────────────────");
-                    println!("           id        {:<20} {} (unchanged — key field)",
-                        old.id, user.id);
+                    println!("           id        {:<20} {} (unchanged — key field)", old.id, user.id);
+
+                    // Only highlight fields that actually changed
                     if old.name != user.name {
                         println!("           name      {:<20} {}", old.name, user.name);
                     } else {
@@ -210,6 +234,7 @@ impl<'a> BTree<'a> {
                     } else {
                         println!("           address   {:<20} (unchanged)", old.address);
                     }
+
                     println!("  [update] 128 bytes written at offset {}..{} in page {}",
                         off, off + crate::config::RECORD_SIZE, leaf_id);
                     println!("  [update] no other slots moved — all offsets unchanged");
@@ -221,7 +246,8 @@ impl<'a> BTree<'a> {
         }
     }
 
-    /// Point lookup by id.
+    /// Point lookup: find and return the record with `id`, or `None` if not found.
+    /// Traverses internal nodes top-down, then binary-searches the leaf.
     pub fn find(&mut self, id: u64) -> std::io::Result<Option<User>> {
         let root_id = self.pager.root_page_id;
         if self.verbose {
@@ -230,7 +256,10 @@ impl<'a> BTree<'a> {
         self.find_recursive(root_id, id)
     }
 
-    /// Range query [start_id, end_id] inclusive.
+    /// Range scan: return all records where `start_id <= id <= end_id`, in ascending order.
+    ///
+    /// Locates the first qualifying leaf via tree traversal, then follows the leaf linked
+    /// list (via `next_page_id`) until a record's id exceeds `end_id` or the chain ends.
     pub fn range(&mut self, start_id: u64, end_id: u64) -> std::io::Result<Vec<User>> {
         let root_id = self.pager.root_page_id;
         if self.verbose {
@@ -246,6 +275,7 @@ impl<'a> BTree<'a> {
             if current_leaf_id == u32::MAX {
                 break;
             }
+
             let page = self.pager.read_page(current_leaf_id)?;
             let hdr = page.header();
             let mut done = false;
@@ -254,7 +284,7 @@ impl<'a> BTree<'a> {
             for i in 0..hdr.num_slots {
                 let rec = page.leaf_read(i);
                 if rec.id > end_id {
-                    done = true;
+                    done = true; // no more records can qualify in this or later leaves
                     break;
                 }
                 if rec.id >= start_id {
@@ -264,10 +294,14 @@ impl<'a> BTree<'a> {
             }
 
             if self.verbose {
-                let first = if hdr.num_slots > 0 { page.leaf_read(0).id } else { 0 };
-                let last  = if hdr.num_slots > 0 { page.leaf_read(hdr.num_slots - 1).id } else { 0 };
-                let next  = hdr.next_page_id;
-                let next_str = if next == u32::MAX { "none (end of chain)".to_string() } else { format!("page {}", next) };
+                let first    = if hdr.num_slots > 0 { page.leaf_read(0).id } else { 0 };
+                let last     = if hdr.num_slots > 0 { page.leaf_read(hdr.num_slots - 1).id } else { 0 };
+                let next     = hdr.next_page_id;
+                let next_str = if next == u32::MAX {
+                    "none (end of chain)".to_string()
+                } else {
+                    format!("page {}", next)
+                };
                 println!(
                     "  [leaf {}] page {:4} │ {:3} records (id {}..{}) │ collected {} │ next → {}{}",
                     leaf_num, current_leaf_id, hdr.num_slots, first, last,
@@ -278,7 +312,7 @@ impl<'a> BTree<'a> {
 
             leaf_num += 1;
             if done { break; }
-            current_leaf_id = hdr.next_page_id;
+            current_leaf_id = hdr.next_page_id; // follow the leaf chain
         }
 
         Ok(results)
@@ -286,6 +320,11 @@ impl<'a> BTree<'a> {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
+    /// Recursively descend the tree from `page_id` to insert `user`.
+    ///
+    /// On reaching a leaf, delegates to `leaf_insert`. On an internal node, routes to the
+    /// correct child and, if that child split, absorbs the pushed-up key (`internal_insert`).
+    /// Returns `Some(SplitResult)` if this page also needs to split, else `None`.
     fn insert_recursive(&mut self, page_id: u32, user: &User) -> std::io::Result<Option<SplitResult>> {
         let page = self.pager.read_page(page_id)?;
         let hdr = page.header();
@@ -293,11 +332,9 @@ impl<'a> BTree<'a> {
         if self.verbose {
             match hdr.page_type {
                 PageType::Internal => {
-                    let (child_id, reason) = page.internal_find_child_logged(user.id);
+                    let (_, reason) = page.internal_find_child_logged(user.id);
                     println!("  [insert] page {:4} [INTERNAL, {:3} keys  ] → {}",
                         page_id, hdr.num_slots, reason);
-                    // recurse after logging
-                    let _ = child_id; // already computed inside internal_insert
                 }
                 PageType::Leaf => {
                     let n = hdr.num_slots as usize;
@@ -317,11 +354,20 @@ impl<'a> BTree<'a> {
         }
     }
 
+    /// Insert `user` into the leaf at `page_id`.
+    ///
+    /// **No-split path**: there is room; find the sorted position, shift later records
+    /// right, write the new record, update `num_slots`, and flush the page.
+    ///
+    /// **Split path**: the leaf is full (31 records). Collect all 31 existing records
+    /// plus the new one (32 total), sort by id, split at midpoint 16. The left half
+    /// stays on the original page; the right half goes to a freshly allocated page.
+    /// The first id of the right half becomes the separator key pushed up to the parent.
     fn leaf_insert(&mut self, page_id: u32, mut page: Page, user: &User) -> std::io::Result<Option<SplitResult>> {
         if !page.leaf_is_full() {
             let n = page.header().num_slots as usize;
 
-            // Find insertion slot index before mutating
+            // Compute insertion slot before mutating the page
             let insert_pos = (0..n).find(|&i| page.leaf_read(i as u32).id > user.id).unwrap_or(n);
 
             if self.verbose {
@@ -358,7 +404,7 @@ impl<'a> BTree<'a> {
             return Ok(None);
         }
 
-        // Leaf is full — split
+        // Leaf is full — must split
         let n = page.header().num_slots as usize;
 
         if self.verbose {
@@ -368,13 +414,13 @@ impl<'a> BTree<'a> {
 
         let new_leaf_id = self.pager.allocate_page()?;
 
-        // Collect all records + new one, sorted
+        // Merge existing records with the new one into one sorted vec
         let mut records: Vec<User> = (0..n as u32).map(|i| page.leaf_read(i)).collect();
         let pos = records.partition_point(|r| r.id < user.id);
         records.insert(pos, user.clone());
 
         let mid = records.len() / 2;
-        let pushed_up_key = records[mid].id;
+        let pushed_up_key = records[mid].id; // smallest id in the right half becomes separator
 
         if self.verbose {
             println!("  [insert] merging {} existing + 1 new = {} records, sorted",
@@ -388,7 +434,7 @@ impl<'a> BTree<'a> {
                 pushed_up_key, pushed_up_key, new_leaf_id);
         }
 
-        // Left leaf keeps [0..mid)
+        // Build the left half: records[0..mid], next_leaf points to the new right page
         let mut left = Page::new();
         let old_next = page.header().next_page_id;
         let mut left_hdr = PageHeader::new(PageType::Leaf);
@@ -403,10 +449,10 @@ impl<'a> BTree<'a> {
             left.write_header(&h);
         }
 
-        // Right leaf keeps [mid..]
+        // Build the right half: records[mid..], next_leaf inherits the old right pointer
         let mut right = Page::new();
         let mut right_hdr = PageHeader::new(PageType::Leaf);
-        right_hdr.next_page_id = old_next;
+        right_hdr.next_page_id = old_next; // preserve the chain: right → whatever left used to point to
         right.write_header(&right_hdr);
         for (i, rec) in records[mid..].iter().enumerate() {
             right.leaf_write(i as u32, rec);
@@ -425,21 +471,25 @@ impl<'a> BTree<'a> {
                 if old_next == u32::MAX { "none".to_string() } else { old_next.to_string() });
         }
 
+        // Left half reuses the original page_id (keeps existing parent pointers valid)
         self.pager.write_page(page_id, &left)?;
         self.pager.write_page(new_leaf_id, &right)?;
 
         Ok(Some(SplitResult { pushed_up_key, new_page_id: new_leaf_id }))
     }
 
+    /// Route the insert through an internal node, then absorb any split propagated up
+    /// from the child. If this internal node also overflows, splits it and propagates
+    /// the mid key further up.
     fn internal_insert(&mut self, page_id: u32, page: Page, user: &User) -> std::io::Result<Option<SplitResult>> {
         let child_id = page.internal_find_child(user.id);
         let split = self.insert_recursive(child_id, user)?;
 
         let Some(s) = split else {
-            return Ok(None);
+            return Ok(None); // child did not split — nothing more to do
         };
 
-        // Re-read page (child writes may have changed pager state but not this page)
+        // Re-read this page; child writes do not mutate our copy but we need the latest header
         let mut page = self.pager.read_page(page_id)?;
 
         if !page.internal_is_full() {
@@ -453,7 +503,7 @@ impl<'a> BTree<'a> {
             return Ok(None);
         }
 
-        // Internal node is full — split it
+        // Internal node is also full — split it and push the mid key further up
         if self.verbose {
             println!("  [insert] internal page {} is FULL — splitting internal node", page_id);
         }
@@ -464,14 +514,14 @@ impl<'a> BTree<'a> {
         let mut entries: Vec<(u64, u32)> = (0..n as u32).map(|i| page.internal_entry(i)).collect();
         let leftmost = page.internal_leftmost_child();
 
-        // Insert the new separator
+        // Insert the new separator from the child split
         let pos = entries.partition_point(|(k, _)| *k < s.pushed_up_key);
         entries.insert(pos, (s.pushed_up_key, s.new_page_id));
 
         let mid = entries.len() / 2;
-        let mid_key = entries[mid].0;
+        let mid_key = entries[mid].0; // mid key is pushed up; it does NOT stay in either half
 
-        // Left internal: leftmost child + entries[0..mid)
+        // Left internal node: leftmost child + entries[0..mid)
         let mut left = Page::new();
         left.write_header(&PageHeader::new(PageType::Internal));
         left.internal_set_leftmost_child(leftmost);
@@ -484,7 +534,7 @@ impl<'a> BTree<'a> {
             left.write_header(&h);
         }
 
-        // Right internal: entries[mid].1 becomes leftmost child, entries[mid+1..] are keys
+        // Right internal node: entries[mid].1 becomes the leftmost child, entries[mid+1..] are keys
         let right_leftmost = entries[mid].1;
         let mut right = Page::new();
         right.write_header(&PageHeader::new(PageType::Internal));
@@ -504,6 +554,9 @@ impl<'a> BTree<'a> {
         Ok(Some(SplitResult { pushed_up_key: mid_key, new_page_id: new_internal_id }))
     }
 
+    /// Recursive top-down search for `id`. Returns `Some(User)` if found, else `None`.
+    /// On internal nodes, follows the appropriate child based on separator keys.
+    /// On leaf nodes, binary-searches the sorted slot array.
     fn find_recursive(&mut self, page_id: u32, id: u64) -> std::io::Result<Option<User>> {
         let page = self.pager.read_page(page_id)?;
         let hdr = page.header();
@@ -540,6 +593,13 @@ impl<'a> BTree<'a> {
         }
     }
 
+    /// Descend the tree to find the leaf page that should contain `id`.
+    ///
+    /// Unlike `find_recursive`, this does not search within the leaf — it just returns
+    /// the leaf page id. Used by `delete`, `update`, and `range` which need the page id
+    /// itself rather than the record value.
+    ///
+    /// Returns `u32::MAX` if the tree degenerates to a meta page (should not happen).
     fn find_leaf_page(&mut self, page_id: u32, id: u64) -> std::io::Result<u32> {
         let page = self.pager.read_page(page_id)?;
         let hdr = page.header();
