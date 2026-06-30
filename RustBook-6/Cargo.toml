@@ -1,0 +1,8 @@
+[package]
+name = "RustBook-6"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rtest = "0.2.2"
+
